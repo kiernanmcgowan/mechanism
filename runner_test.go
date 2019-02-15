@@ -1,7 +1,6 @@
 package mechanism
 
 import (
-	"encoding/json"
 	"testing"
 	"time"
 )
@@ -105,13 +104,13 @@ func Test_SafeEnvokePanicJob(t *testing.T) {
 func Test_RegisterJob(t *testing.T) {
 	w := NewWorker("", &mockedSQS{}, 1)
 
-	err := registerSampleJob(w)
+	_, err := registerSampleTransport(w)
 
 	if err != nil {
 		t.Fatal("RegisterJob returned nil new a new register")
 	}
 
-	err = registerSampleJob(w)
+	_, err = registerSampleTransport(w)
 
 	if err == nil {
 		t.Fatal("RegisterJob did not return nil for a duplicate register")
@@ -121,41 +120,46 @@ func Test_RegisterJob(t *testing.T) {
 func Test_EnqueueJob(t *testing.T) {
 	w := NewWorker("", &mockedSQS{}, 1)
 
-	registerSampleJob(w)
+	c, err := registerSampleTransport(w)
+	if err != nil {
+		t.Fatalf("Failed to register transport %v", err)
+	}
+
+	var enqueueCalled bool
+	w.OnEnqueue(func(id string, j Job) {
+		enqueueCalled = true
+		if id == "" {
+			t.Fatal("ID is empty string")
+		}
+	})
 
 	job := TestJob{Resolve: Success}
-	id, err := w.Enqueue("sample", job)
+	c <- job
+
 	if err != nil {
 		t.Fatalf("Failed to enqueue %v", err)
 	}
-	if id == "" {
-		t.Fatal("ID is empty string")
-	}
 
-	if len(w.pusher.queue) != 1 {
-		t.Fatal("pusher did not receive object")
-	}
-}
+	defer func() {
+		if !enqueueCalled {
+			t.Fatal("OnEnqueue was never invoked")
+		}
 
-func Test_EnqueueUnknownJob(t *testing.T) {
-	w := NewWorker("", &mockedSQS{}, 1)
-
-	job := TestJob{Resolve: Success}
-	id, err := w.Enqueue("sample", job)
-	if id != "" {
-		t.Fatal("ID is not empty string")
-	}
-	if err == nil {
-		t.Fatal("Did not receive error for enqueuing unknown job")
-	}
-
+		if len(w.pusher.queue) != 1 {
+			t.Fatal("pusher did not receive object")
+		}
+	}()
 }
 
 func Test_SimpleEndToEnd(t *testing.T) {
 	w := NewWorker("", &mockedSQS{}, 1)
 
 	var jobID string
-	successCalled, invokeCalled := false, false
+	enqueueCalled, successCalled, invokeCalled := false, false, false
+	w.OnEnqueue(func(id string, j Job) {
+		enqueueCalled = true
+		jobID = id
+	})
 	w.OnInvoke(func(id string, j Job) {
 		invokeCalled = true
 		if id != jobID {
@@ -170,12 +174,12 @@ func Test_SimpleEndToEnd(t *testing.T) {
 		}
 	})
 
-	registerSampleJob(w)
-	job := TestJob{Resolve: Success}
-	jobID, err := w.Enqueue("sample", job)
+	c, err := registerSampleTransport(w)
 	if err != nil {
-		t.Fatalf("Failed to enqueue job %v", err)
+		t.Fatalf("Failed to register transport %v", err)
 	}
+	job := TestJob{Resolve: Success}
+	c <- job
 
 	cerr := w.Run()
 	go func() {
@@ -187,6 +191,9 @@ func Test_SimpleEndToEnd(t *testing.T) {
 		t.Fatalf("Got error from worker %v", err)
 	}
 	defer func() {
+		if !enqueueCalled {
+			t.Fatal("OnEnqueue was never invoked")
+		}
 		if !invokeCalled {
 			t.Fatal("OnInvoke was never invoked")
 		}
@@ -197,15 +204,7 @@ func Test_SimpleEndToEnd(t *testing.T) {
 	}()
 }
 
-func registerSampleJob(w *Worker) error {
-	return w.RegisterJob("sample",
-		func(j Job) ([]byte, error) {
-			return json.Marshal(j)
-		},
-		func(b []byte) (Job, error) {
-			var j TestJob
-			err := json.Unmarshal(b, &j)
-			return j, err
-		},
-	)
+func registerSampleTransport(w *Worker) (chan<- Job, error) {
+	p := &porter{}
+	return w.RegisterTransporter("sample", p)
 }

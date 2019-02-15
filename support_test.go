@@ -71,3 +71,15 @@ type PanicJob struct{}
 func (p PanicJob) Invoke() Status {
 	panic("we're going down!")
 }
+
+type porter struct{}
+
+func (p porter) Marshal(j Job) ([]byte, error) {
+	return json.Marshal(j)
+}
+
+func (p porter) Unmarshal(b []byte) (Job, error) {
+	t := TestJob{}
+	err := json.Unmarshal(b, &t)
+	return t, err
+}

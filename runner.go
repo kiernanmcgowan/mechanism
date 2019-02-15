@@ -5,14 +5,10 @@ import (
 	"sync"
 
 	"github.com/aws/aws-sdk-go/service/sqs/sqsiface"
+	"github.com/pkg/errors"
 
 	"github.com/google/uuid"
 )
-
-type serde struct {
-	Ser Serializer
-	De  Deserializer
-}
 
 // Callback is a func(id string, j Job) that can be invoked to watch whats going through the worker
 type Callback func(string, Job)
@@ -22,18 +18,19 @@ type PanicCallback func(interface{})
 
 // Worker manages pulling or enqueuing jobs from SQS
 type Worker struct {
-	serdeMap map[string]serde
-	puller   *puller
-	pusher   *pusher
+	transporterMap map[string]Transporter
+	puller         *puller
+	pusher         *pusher
 
 	errChan    chan error
 	jobCounter chan bool
 	quit       chan bool
 
-	invokeCBs  []Callback
-	successCBs []Callback
-	failCBs    []Callback
-	panicedCBs []PanicCallback
+	enqueuedCBs []Callback
+	invokeCBs   []Callback
+	successCBs  []Callback
+	failCBs     []Callback
+	panicedCBs  []PanicCallback
 
 	lock *sync.RWMutex
 }
@@ -43,9 +40,9 @@ type Worker struct {
 // Note that setting maxJobs = 0 will remove parallelization of mechanism, causing one job to be processed at a time
 func NewWorker(queueURL string, sqs sqsiface.SQSAPI, maxJobs int) *Worker {
 	return &Worker{
-		serdeMap: make(map[string]serde),
-		puller:   newPuller(queueURL, sqs),
-		pusher:   newPusher(queueURL, sqs),
+		transporterMap: make(map[string]Transporter),
+		puller:         newPuller(queueURL, sqs),
+		pusher:         newPusher(queueURL, sqs),
 
 		errChan:    make(chan error),
 		jobCounter: make(chan bool, maxJobs),
@@ -69,14 +66,14 @@ func (w *Worker) Run() <-chan error {
 				close(w.errChan)
 				return
 			case payload := <-w.puller.queue:
-				if _, ok := w.serdeMap[payload.Name]; !ok {
+				if _, ok := w.transporterMap[payload.Name]; !ok {
 					w.errChan <- fmt.Errorf("Don't know how to deserialize job with name=%s", payload.Name)
 					continue
 				}
 
-				j, err := w.serdeMap[payload.Name].De(payload.Payload)
+				j, err := w.transporterMap[payload.Name].Unmarshal(payload.Payload)
 				if err != nil {
-					w.errChan <- err
+					w.errChan <- errors.Wrap(err, "job unmarshal failed")
 					continue
 				}
 
@@ -128,6 +125,19 @@ func (w *Worker) start() {
 	}()
 }
 
+// OnEnqueue is called just before a jobed onto the queue over the wire
+func (w *Worker) OnEnqueue(c ...Callback) {
+	w.lock.Lock()
+	w.enqueuedCBs = append(w.enqueuedCBs, c...)
+	w.lock.Unlock()
+}
+
+func (w *Worker) enqueued(id string, j Job) {
+	for _, f := range w.enqueuedCBs {
+		f(id, j)
+	}
+}
+
 // OnInvoke is called just before a job's Invoke func is called
 func (w *Worker) OnInvoke(c ...Callback) {
 	w.lock.Lock()
@@ -154,7 +164,7 @@ func (w *Worker) successful(id string, j Job) {
 	}
 }
 
-// OnFail is called just after a job's Invoke func returns with a Fail
+// OnFail is called just after a job's `Invoke` func returns with a Fail
 func (w *Worker) OnFail(c ...Callback) {
 	w.lock.Lock()
 	w.failCBs = append(w.failCBs, c...)
@@ -180,44 +190,37 @@ func (w *Worker) paniced(err interface{}) {
 	}
 }
 
-// Enqueue will serialize a Job j with Serializer attached to name and enqueue it
-// The transport id is returned if successfully pushed seralized, otherwise ("", error) is returned
-func (w *Worker) Enqueue(name string, j Job) (string, error) {
-	if _, ok := w.serdeMap[name]; !ok {
-		return "", fmt.Errorf("Don't know how to serialize job with name=%s", name)
-	}
-
-	payload, err := w.serdeMap[name].Ser(j)
-	if err != nil {
-		return "", err
-	}
-	id := uuid.New().String()
-	jp := transport{
-		Name:    name,
-		ID:      id,
-		Payload: payload,
-	}
-	w.pusher.queue <- jp
-	return id, nil
-}
-
-// RegisterJob provides mechanism with the seralization/deserialization needed to transport jobs across an external queue
-// Returns an error if there is already a job with the given name registered
-func (w *Worker) RegisterJob(name string, ser Serializer, de Deserializer) error {
-	// guard against accidental panics
-	if w.serdeMap == nil {
-		w.serdeMap = make(map[string]serde)
-	}
-	if _, ok := w.serdeMap[name]; ok {
-		return fmt.Errorf("Job with name=%s already registerd", name)
+// RegisterTransporter provides mechanism with a Transporter for a given namespace.
+// Transporters MUST be registered with the same name where jobs are sent and received so that they can be routed to the proper Transporter.
+// Returns a send only channel for pushing jobs onto the queue or an error if there is already a job with the given name registered
+// Use this send only channel for enqueueing jobs.
+func (w *Worker) RegisterTransporter(name string, t Transporter) (chan<- Job, error) {
+	if _, ok := w.transporterMap[name]; ok {
+		return nil, fmt.Errorf("Job with name=%s already registered", name)
 	}
 
 	w.lock.Lock()
-	w.serdeMap[name] = serde{
-		Ser: ser,
-		De:  de,
-	}
+	w.transporterMap[name] = t
 	w.lock.Unlock()
 
-	return nil
+	c := make(chan Job)
+	go func() {
+		for j := range c {
+			payload, err := w.transporterMap[name].Marshal(j)
+			if err != nil {
+				w.errChan <- errors.Wrap(err, "job unmarshal failed")
+				continue
+			}
+			id := uuid.New().String()
+			jp := transport{
+				Name:    name,
+				ID:      id,
+				Payload: payload,
+			}
+			w.enqueued(id, j)
+			w.pusher.queue <- jp
+		}
+	}()
+
+	return c, nil
 }
