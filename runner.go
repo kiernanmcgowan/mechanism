@@ -73,7 +73,7 @@ func (w *Worker) Run() <-chan error {
 
 				j, err := w.transporterMap[payload.Name].Unmarshal(payload.Payload)
 				if err != nil {
-					w.errChan <- errors.Wrap(err, "job unmarshal failed")
+					w.errChan <- errors.Wrapf(err, "job unmarshal failed name=%s", payload.Name)
 					continue
 				}
 
@@ -208,7 +208,7 @@ func (w *Worker) RegisterTransporter(name string, t Transporter) (chan<- Job, er
 		for j := range c {
 			payload, err := w.transporterMap[name].Marshal(j)
 			if err != nil {
-				w.errChan <- errors.Wrap(err, "job unmarshal failed")
+				w.errChan <- errors.Wrapf(err, "job unmarshal failed name=%s", name)
 				continue
 			}
 			id := uuid.New().String()
