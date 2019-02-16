@@ -22,7 +22,7 @@ type Worker struct {
 	puller         *puller
 	pusher         *pusher
 
-	errChan    chan error
+	errc       chan error
 	jobCounter chan bool
 	quit       chan bool
 
@@ -44,7 +44,7 @@ func NewWorker(queueURL string, sqs sqsiface.SQSAPI, maxJobs int) *Worker {
 		puller:         newPuller(queueURL, sqs),
 		pusher:         newPusher(queueURL, sqs),
 
-		errChan:    make(chan error),
+		errc:       make(chan error),
 		jobCounter: make(chan bool, maxJobs),
 		quit:       make(chan bool),
 
@@ -55,7 +55,7 @@ func NewWorker(queueURL string, sqs sqsiface.SQSAPI, maxJobs int) *Worker {
 // Run turns on this mechanism worker.
 // The worker will start listening to the provided SQS queue and process jobs as they come in
 func (w *Worker) Run() <-chan error {
-	w.start()
+	mergedErrc := merge(w.puller.start(), w.pusher.start(), w.errc)
 
 	go func() {
 		for {
@@ -63,17 +63,17 @@ func (w *Worker) Run() <-chan error {
 			case <-w.quit:
 				w.puller.stop()
 				w.pusher.stop()
-				close(w.errChan)
+				close(w.errc)
 				return
 			case payload := <-w.puller.queue:
 				if _, ok := w.transporterMap[payload.Name]; !ok {
-					w.errChan <- fmt.Errorf("Don't know how to deserialize job with name=%s", payload.Name)
+					w.errc <- fmt.Errorf("Don't know how to deserialize job with name=%s", payload.Name)
 					continue
 				}
 
 				j, err := w.transporterMap[payload.Name].Unmarshal(payload.Payload)
 				if err != nil {
-					w.errChan <- errors.Wrapf(err, "job unmarshal failed name=%s", payload.Name)
+					w.errc <- errors.Wrapf(err, "job unmarshal failed name=%s", payload.Name)
 					continue
 				}
 
@@ -82,7 +82,7 @@ func (w *Worker) Run() <-chan error {
 		}
 	}()
 
-	return w.errChan
+	return mergedErrc
 }
 
 // Stop will cause this worker to stop pulling jobs for processing and will close channels for pushing jobs
@@ -109,20 +109,6 @@ func (w *Worker) safeInvoke(id string, j Job) {
 	case Fail:
 		w.failed(id, j)
 	}
-}
-
-func (w *Worker) start() {
-	go func() {
-		for e := range w.puller.start() {
-			w.errChan <- e
-		}
-	}()
-
-	go func() {
-		for e := range w.pusher.start() {
-			w.errChan <- e
-		}
-	}()
 }
 
 // OnEnqueue is called just before a jobed onto the queue over the wire
@@ -208,7 +194,7 @@ func (w *Worker) RegisterTransporter(name string, t Transporter) (chan<- Job, er
 		for j := range c {
 			payload, err := w.transporterMap[name].Marshal(j)
 			if err != nil {
-				w.errChan <- errors.Wrapf(err, "job unmarshal failed name=%s", name)
+				w.errc <- errors.Wrapf(err, "job unmarshal failed name=%s", name)
 				continue
 			}
 			id := uuid.New().String()
@@ -223,4 +209,23 @@ func (w *Worker) RegisterTransporter(name string, t Transporter) (chan<- Job, er
 	}()
 
 	return c, nil
+}
+
+func merge(cs ...<-chan error) <-chan error {
+	out := make(chan error)
+	var wg sync.WaitGroup
+	wg.Add(len(cs))
+	for _, c := range cs {
+		go func(c <-chan error) {
+			for v := range c {
+				out <- v
+			}
+			wg.Done()
+		}(c)
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
 }

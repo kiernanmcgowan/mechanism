@@ -34,18 +34,20 @@ func newPuller(sqsURL string, sqs sqsiface.SQSAPI) *puller {
 }
 
 func (p *puller) start() <-chan error {
-	cerr := make(chan error)
+	errc := make(chan error)
 	go func() {
 		for {
 			select {
 			case <-p.quit:
-				close(cerr)
+				close(errc)
 				close(p.queue)
 				return
 			default:
 				jobs, err := p.pollQueue()
 				if err != nil {
-					cerr <- err
+					errc <- err
+					d := p.backoff.Duration()
+					time.Sleep(d)
 					continue
 				}
 
@@ -63,7 +65,7 @@ func (p *puller) start() <-chan error {
 		}
 
 	}()
-	return cerr
+	return errc
 }
 
 func (p *puller) stop() {
