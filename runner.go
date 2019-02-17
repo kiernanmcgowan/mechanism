@@ -85,6 +85,13 @@ func (w *Worker) Run() <-chan error {
 	return mergedErrc
 }
 
+// PusherOnlyRun turns on the worker to send jobs to the queue, but not to process them
+// Useful for enqueueing jobs w/o needing to run them
+func (w *Worker) PusherOnlyRun() <-chan error {
+	mergedErrc := merge(w.pusher.start(), w.errc)
+	return mergedErrc
+}
+
 // Stop will cause this worker to stop pulling jobs for processing and will close channels for pushing jobs
 // Any active jobs that are still running will continue to run
 func (w *Worker) Stop() {

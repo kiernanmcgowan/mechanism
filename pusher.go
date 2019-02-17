@@ -31,7 +31,7 @@ func newPusher(sqsURL string, sqs sqsiface.SQSAPI) *pusher {
 func (p *pusher) start() <-chan error {
 	var ts []transport
 	ticker := time.NewTicker(p.flushTimeout)
-	cerr := make(chan error)
+	errc := make(chan error)
 	go func() {
 		for {
 			select {
@@ -40,7 +40,7 @@ func (p *pusher) start() <-chan error {
 				if len(ts) == 10 {
 					err := p.pushJobs(ts)
 					if err != nil {
-						cerr <- err
+						errc <- err
 						continue
 					}
 					ts = nil
@@ -49,13 +49,13 @@ func (p *pusher) start() <-chan error {
 				if len(ts) > 0 {
 					err := p.pushJobs(ts)
 					if err != nil {
-						cerr <- err
+						errc <- err
 						continue
 					}
 					ts = nil
 				}
 			case <-p.quit:
-				close(cerr)
+				close(errc)
 				close(p.queue)
 				return
 			}
@@ -63,7 +63,7 @@ func (p *pusher) start() <-chan error {
 		}
 	}()
 
-	return cerr
+	return errc
 }
 
 func (p *pusher) stop() {
