@@ -10,7 +10,7 @@ import (
 func Test_PullerSetupTeardown(t *testing.T) {
 	// Test listening, then stopping
 	p := newPuller("", &mockedSQS{})
-	cerr := p.start()
+	errc := p.start()
 
 	// stop at some point in the future
 	go func() {
@@ -18,15 +18,15 @@ func Test_PullerSetupTeardown(t *testing.T) {
 		p.stop()
 	}()
 
-	err := <-cerr
+	err := <-errc
 	if err != nil {
-		t.Errorf("Recieved not nil error from listen %v", err)
+		t.Errorf("Received not nil error from listen %v", err)
 	}
 }
 
 func Test_PullerBasic(t *testing.T) {
 	p := newPuller("", &mockedSQS{Jobs: genTransport(1)})
-	cerr := p.start()
+	errc := p.start()
 
 	// stop at some point in the future
 	go func() {
@@ -40,18 +40,18 @@ func Test_PullerBasic(t *testing.T) {
 	}
 
 	if len(out) != 1 {
-		t.Errorf("Unexpcted number of jobs returned, wated=%d got=%d", 1, len(out))
+		t.Errorf("Unexpected number of jobs returned, wanted=%d got=%d", 1, len(out))
 	}
 
-	err := <-cerr
+	err := <-errc
 	if err != nil {
-		t.Errorf("Recieved not nil error from listen %v", err)
+		t.Errorf("Received not nil error from listen %v", err)
 	}
 }
 
 func Test_PullerBacksoff(t *testing.T) {
 	p := newPuller("", &mockedSQS{Jobs: nil})
-	cerr := p.start()
+	errc := p.start()
 
 	// stop at some point in the future
 	go func() {
@@ -59,9 +59,9 @@ func Test_PullerBacksoff(t *testing.T) {
 		p.stop()
 	}()
 
-	err := <-cerr
+	err := <-errc
 	if err != nil {
-		t.Errorf("Recieved not nil error from listen %v", err)
+		t.Errorf("Received not nil error from listen %v", err)
 	}
 
 	if p.backoff.Attempt() == 0 {
@@ -75,7 +75,7 @@ func Test_PullerBacksoff(t *testing.T) {
 
 func Test_PullerReceiveError(t *testing.T) {
 	p := newPuller("", &mockedSQS{ReceiveMessageError: fmt.Errorf("beep boop")})
-	cerr := p.start()
+	errc := p.start()
 
 	// stop at some point in the future
 	go func() {
@@ -83,18 +83,18 @@ func Test_PullerReceiveError(t *testing.T) {
 		p.stop()
 	}()
 
-	err := <-cerr
+	err := <-errc
 	if err == nil {
-		t.Fatal("Recieved nil as an error when one was expected")
+		t.Fatal("Received nil as an error when one was expected")
 	}
 	if err.Error() != "beep boop" {
-		t.Fatalf("Recieved wrong error from channel %v", err)
+		t.Fatalf("Received wrong error from channel %v", err)
 	}
 }
 
 func Test_PullerDeleteError(t *testing.T) {
 	p := newPuller("", &mockedSQS{Jobs: genTransport(1), DeleteMessageError: fmt.Errorf("beep boop")})
-	cerr := p.start()
+	errc := p.start()
 
 	// stop at some point in the future
 	go func() {
@@ -103,12 +103,12 @@ func Test_PullerDeleteError(t *testing.T) {
 		p.stop()
 	}()
 
-	err := <-cerr
+	err := <-errc
 	if err == nil {
-		t.Fatal("Recieved nil as an error when one was expected")
+		t.Fatal("Received nil as an error when one was expected")
 	}
 	if err.Error() != "beep boop" {
-		t.Fatalf("Recieved wrong error from channel %v", err)
+		t.Fatalf("Received wrong error from channel %v", err)
 	}
 }
 

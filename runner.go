@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/apex/log"
 	"github.com/aws/aws-sdk-go/service/sqs/sqsiface"
 	"github.com/pkg/errors"
 
@@ -14,64 +15,85 @@ import (
 type Callback func(string, Job)
 
 // PanicCallback is a func(interface{}) thats called when a Job panics, which the worker recovers from
-type PanicCallback func(interface{})
+type PanicCallback func(string, interface{})
 
-// Worker manages pulling or enqueuing jobs from SQS
-type Worker struct {
-	transporterMap map[string]Transporter
-	puller         *puller
-	pusher         *pusher
+// package level vars so jobs and middleware can be connected w/o the need for passing a worker around
+var (
+	encoderMap map[string]JobEncoder
+	jobQueue   *pusher
+	lock       *sync.RWMutex
+	callbacks  map[State][]Callback
+	panicedCBs []PanicCallback
+)
 
-	errc       chan error
-	jobCounter chan bool
-	quit       chan bool
+func init() {
+	if encoderMap == nil {
+		encoderMap = make(map[string]JobEncoder)
+	}
 
-	enqueuedCBs []Callback
-	invokeCBs   []Callback
-	successCBs  []Callback
-	failCBs     []Callback
-	panicedCBs  []PanicCallback
+	if callbacks == nil {
+		callbacks = make(map[State][]Callback)
+	}
 
-	lock *sync.RWMutex
-}
-
-// NewWorker creates a Worker pointed at the specified queueURL with the sqs service.
-// Workers will spawn up to maxJobs goroutines to process jobs from the SQS queue.
-// Note that setting maxJobs = 0 will remove parallelization of mechanism, causing one job to be processed at a time
-func NewWorker(queueURL string, sqs sqsiface.SQSAPI, maxJobs int) *Worker {
-	return &Worker{
-		transporterMap: make(map[string]Transporter),
-		puller:         newPuller(queueURL, sqs),
-		pusher:         newPusher(queueURL, sqs),
-
-		errc:       make(chan error),
-		jobCounter: make(chan bool, maxJobs),
-		quit:       make(chan bool),
-
-		lock: &sync.RWMutex{},
+	if lock == nil {
+		lock = &sync.RWMutex{}
 	}
 }
 
-// Run turns on this mechanism worker.
+type Worker struct {
+	puller *puller
+
+	errc       chan error
+	jobCounter chan string
+	quit       chan bool
+}
+
+// InitWorker creates a Worker pointed at the specified queueURL with the sqs service.
+// Workers will spawn up to maxJobs goroutines to process jobs from the SQS queue.
+// Note that setting maxJobs = 0 will remove parallelization of mechanism, causing one job to be processed at a time
+func InitWorker(queueURL string, sqs sqsiface.SQSAPI, maxJobs int) *Worker {
+	initPusher(queueURL, sqs)
+	return &Worker{
+		puller: newPuller(queueURL, sqs),
+
+		errc:       make(chan error),
+		jobCounter: make(chan string, maxJobs),
+		quit:       make(chan bool),
+	}
+}
+
+func InitClient(queueURL string, sqs sqsiface.SQSAPI) <-chan error {
+	initPusher(queueURL, sqs)
+	return jobQueue.start()
+}
+
+func initPusher(queueURL string, sqs sqsiface.SQSAPI) {
+	if jobQueue != nil {
+		return
+	}
+	jobQueue = newPusher(queueURL, sqs)
+}
+
+// Start turns on this mechanism worker.
 // The worker will start listening to the provided SQS queue and process jobs as they come in
-func (w *Worker) Run() <-chan error {
-	mergedErrc := merge(w.puller.start(), w.pusher.start(), w.errc)
+func (w *Worker) Start() <-chan error {
+	mergedErrc := merge(w.puller.start(), jobQueue.start(), w.errc)
 
 	go func() {
 		for {
 			select {
 			case <-w.quit:
 				w.puller.stop()
-				w.pusher.stop()
+				jobQueue.stop()
 				close(w.errc)
 				return
 			case payload := <-w.puller.queue:
-				if _, ok := w.transporterMap[payload.Name]; !ok {
+				if _, ok := encoderMap[payload.Name]; !ok {
 					w.errc <- fmt.Errorf("Don't know how to deserialize job with name=%s", payload.Name)
 					continue
 				}
 
-				j, err := w.transporterMap[payload.Name].Unmarshal(payload.Payload)
+				j, err := encoderMap[payload.Name].UnmarshalJob(payload.Payload)
 				if err != nil {
 					w.errc <- errors.Wrapf(err, "job unmarshal failed name=%s", payload.Name)
 					continue
@@ -85,13 +107,6 @@ func (w *Worker) Run() <-chan error {
 	return mergedErrc
 }
 
-// PusherOnlyRun turns on the worker to send jobs to the queue, but not to process them
-// Useful for enqueueing jobs w/o needing to run them
-func (w *Worker) PusherOnlyRun() <-chan error {
-	mergedErrc := merge(w.pusher.start(), w.errc)
-	return mergedErrc
-}
-
 // Stop will cause this worker to stop pulling jobs for processing and will close channels for pushing jobs
 // Any active jobs that are still running will continue to run
 func (w *Worker) Stop() {
@@ -101,107 +116,82 @@ func (w *Worker) Stop() {
 func (w *Worker) safeInvoke(id string, j Job) {
 	defer func() {
 		// open up the job counter
-		<-w.jobCounter
+		finishedID := <-w.jobCounter
 		if err := recover(); err != nil {
-			w.paniced(err)
+			paniced(finishedID, err)
 		}
 	}()
 
 	// mark the job as started
-	w.jobCounter <- true
-	w.invoked(id, j)
+	w.jobCounter <- id
+	notify(Pending, id, j)
 	switch j.Invoke() {
 	case Success:
-		w.successful(id, j)
+		notify(Succeeded, id, j)
 	case Fail:
-		w.failed(id, j)
+		notify(Failed, id, j)
 	}
 }
 
-// OnEnqueue is called just before a jobed onto the queue over the wire
-func (w *Worker) OnEnqueue(c ...Callback) {
-	w.lock.Lock()
-	w.enqueuedCBs = append(w.enqueuedCBs, c...)
-	w.lock.Unlock()
+// OnState registers a set of callbacks when a job passes a given State
+func OnState(s State, c ...Callback) {
+	lock.Lock()
+	defer lock.Unlock()
+	callbacks[s] = append(callbacks[s], c...)
 }
 
-func (w *Worker) enqueued(id string, j Job) {
-	for _, f := range w.enqueuedCBs {
-		f(id, j)
+func notify(s State, id string, j Job) {
+	// return if no callbacks have been registered
+	if _, ok := callbacks[s]; !ok {
+		return
 	}
-}
-
-// OnInvoke is called just before a job's Invoke func is called
-func (w *Worker) OnInvoke(c ...Callback) {
-	w.lock.Lock()
-	w.invokeCBs = append(w.invokeCBs, c...)
-	w.lock.Unlock()
-}
-
-func (w *Worker) invoked(id string, j Job) {
-	for _, f := range w.invokeCBs {
-		f(id, j)
-	}
-}
-
-// OnSuccess is called just after a job's Invoke func returns with a Success
-func (w *Worker) OnSuccess(c ...Callback) {
-	w.lock.Lock()
-	w.successCBs = append(w.successCBs, c...)
-	w.lock.Unlock()
-}
-
-func (w *Worker) successful(id string, j Job) {
-	for _, f := range w.successCBs {
-		f(id, j)
-	}
-}
-
-// OnFail is called just after a job's `Invoke` func returns with a Fail
-func (w *Worker) OnFail(c ...Callback) {
-	w.lock.Lock()
-	w.failCBs = append(w.failCBs, c...)
-	w.lock.Unlock()
-}
-
-func (w *Worker) failed(id string, j Job) {
-	for _, f := range w.failCBs {
-		f(id, j)
+	for _, f := range callbacks[s] {
+		go f(id, j)
 	}
 }
 
 // OnPanic is called after a job panics and this worker recovers from it
-func (w *Worker) OnPanic(c ...PanicCallback) {
-	w.lock.Lock()
-	w.panicedCBs = append(w.panicedCBs, c...)
-	w.lock.Unlock()
+func OnPanic(c ...PanicCallback) {
+	lock.Lock()
+	defer lock.Unlock()
+	panicedCBs = append(panicedCBs, c...)
 }
 
-func (w *Worker) paniced(err interface{}) {
-	for _, f := range w.panicedCBs {
-		f(err)
+func paniced(id string, err interface{}) {
+	for _, f := range panicedCBs {
+		f(id, err)
 	}
 }
 
-// RegisterTransporter provides mechanism with a Transporter for a given namespace.
-// Transporters MUST be registered with the same name where jobs are sent and received so that they can be routed to the proper Transporter.
+// Use registers a given middleware with mechanism's callbacks
+func Use(m Middleware) {
+	for s, cbs := range m.Hooks() {
+		OnState(s, cbs...)
+	}
+
+	OnPanic(m.WhenPanic()...)
+}
+
+// RegisterJobEncoder provides mechanism with a JobEncoder for a given namespace.
+// JobEncoders MUST be registered with the same name where jobs are sent and received so that they can be routed to the proper JobEncoder.
 // Returns a send only channel for pushing jobs onto the queue or an error if there is already a job with the given name registered
 // Use this send only channel for enqueueing jobs.
-func (w *Worker) RegisterTransporter(name string, t Transporter) (chan<- Job, error) {
-	if _, ok := w.transporterMap[name]; ok {
+func RegisterJobEncoder(name string, e JobEncoder) (chan<- Job, error) {
+	if _, ok := encoderMap[name]; ok {
 		return nil, fmt.Errorf("Job with name=%s already registered", name)
 	}
 
-	w.lock.Lock()
-	w.transporterMap[name] = t
-	w.lock.Unlock()
+	lock.Lock()
+	defer lock.Unlock()
+	encoderMap[name] = e
 
 	c := make(chan Job)
 	go func() {
 		for j := range c {
-			payload, err := w.transporterMap[name].Marshal(j)
+			payload, err := encoderMap[name].MarshalJob(j)
 			if err != nil {
-				w.errc <- errors.Wrapf(err, "job unmarshal failed name=%s", name)
+				err = errors.Wrapf(err, "job unmarshal failed name=%s", name)
+				log.WithError(err).Info("skipping job")
 				continue
 			}
 			id := uuid.New().String()
@@ -210,8 +200,8 @@ func (w *Worker) RegisterTransporter(name string, t Transporter) (chan<- Job, er
 				ID:      id,
 				Payload: payload,
 			}
-			w.enqueued(id, j)
-			w.pusher.queue <- jp
+			notify(Enqueued, id, j)
+			jobQueue.queue <- jp
 		}
 	}()
 

@@ -3,6 +3,8 @@ package mechanism
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
+	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -59,11 +61,23 @@ func (m *mockedSQS) SendMessageBatch(input *sqs.SendMessageBatchInput) (*sqs.Sen
 	return nil, nil
 }
 
+var testc, panc chan<- Job
+
+func init() {
+	p := porter{}
+	testc, _ = RegisterJobEncoder("test", p)
+	panc, _ = RegisterJobEncoder("panic", p)
+}
+
 type TestJob struct{ Resolve Status }
 
 func (s TestJob) Invoke() Status {
 	time.Sleep(time.Second)
 	return s.Resolve
+}
+
+func (s TestJob) Enqueue() {
+	testc <- s
 }
 
 type PanicJob struct{}
@@ -72,14 +86,108 @@ func (p PanicJob) Invoke() Status {
 	panic("we're going down!")
 }
 
+func (p PanicJob) Enqueue() {
+	panc <- p
+}
+
 type porter struct{}
 
-func (p porter) Marshal(j Job) ([]byte, error) {
+func (p porter) MarshalJob(j Job) ([]byte, error) {
 	return json.Marshal(j)
 }
 
-func (p porter) Unmarshal(b []byte) (Job, error) {
+func (p porter) UnmarshalJob(b []byte) (Job, error) {
 	t := TestJob{}
 	err := json.Unmarshal(b, &t)
 	return t, err
+}
+
+func Test_SafeInvokePassingJob(t *testing.T) {
+	clearMiddleware()
+	w := initWorker("", &mockedSQS{}, 1)
+
+	jobID := "job id"
+	job := TestJob{Resolve: Success}
+	wg := sync.WaitGroup{}
+
+	wg.Add(1)
+	OnState(Pending, func(id string, j Job) {
+		wg.Done()
+		if id != jobID {
+			t.Errorf("OnState - Pending passed wrong job id, got=%s wanted=%s", id, jobID)
+		}
+	})
+
+	wg.Add(1)
+	OnState(Succeeded, func(id string, j Job) {
+		wg.Done()
+		if id != jobID {
+			t.Errorf("OnState - Succeeded passed wrong job id, got=%s wanted=%s", id, jobID)
+		}
+	})
+
+	w.safeInvoke(jobID, job)
+	wg.Wait()
+}
+
+func Test_SafeInvokeFailingJob(t *testing.T) {
+	clearMiddleware()
+	w := initWorker("", &mockedSQS{}, 1)
+
+	jobID := "job id"
+	job := TestJob{Resolve: Fail}
+	wg := sync.WaitGroup{}
+
+	wg.Add(1)
+	OnState(Pending, func(id string, j Job) {
+		wg.Done()
+		if id != jobID {
+			t.Errorf("OnState - Pending passed wrong job id, got=%s wanted=%s", id, jobID)
+		}
+	})
+
+	wg.Add(1)
+	OnState(Failed, func(id string, j Job) {
+		wg.Done()
+		if id != jobID {
+			t.Errorf("OnState - Failed passed wrong job id, got=%s wanted=%s", id, jobID)
+		}
+	})
+
+	w.safeInvoke(jobID, job)
+	wg.Wait()
+}
+
+func Test_SafeInvokePanicJob(t *testing.T) {
+	clearMiddleware()
+	w := initWorker("", &mockedSQS{}, 1)
+
+	jobID := "job id"
+	job := PanicJob{}
+	wg := sync.WaitGroup{}
+
+	wg.Add(1)
+	OnPanic(func(id string, err interface{}) {
+		wg.Done()
+	})
+
+	w.safeInvoke(jobID, job)
+	wg.Wait()
+}
+
+func Test_RegisterJob(t *testing.T) {
+	clearMiddleware()
+	p := porter{}
+
+	_, err := RegisterJobEncoder("foo", p)
+
+	if err != nil {
+		t.Fatal("RegisterJob returned nil new a new register")
+	}
+
+	_, err = RegisterJobEncoder("foo", p)
+
+	if err == nil {
+		t.Fatal("RegisterJob did not return nil for a duplicate register")
+	}
 }
