@@ -24,6 +24,8 @@ func (m *mockedSQS) ReceiveMessage(input *sqs.ReceiveMessageInput) (*sqs.Receive
 	if m.ReceiveMessageError != nil {
 		return nil, m.ReceiveMessageError
 	}
+	lock.Lock()
+	defer lock.Unlock()
 	var ms []*sqs.Message
 	for _, j := range m.Jobs {
 		b, _ := json.Marshal(j)
@@ -39,6 +41,8 @@ func (m *mockedSQS) DeleteMessageBatch(input *sqs.DeleteMessageBatchInput) (*sqs
 	if m.DeleteMessageError != nil {
 		return nil, m.DeleteMessageError
 	}
+	lock.Lock()
+	defer lock.Unlock()
 	for _, e := range input.Entries {
 		delete(m.Jobs, *e.Id)
 	}
@@ -49,6 +53,8 @@ func (m *mockedSQS) SendMessageBatch(input *sqs.SendMessageBatchInput) (*sqs.Sen
 	if m.SendMessageError != nil {
 		return nil, m.SendMessageError
 	}
+	lock.Lock()
+	defer lock.Unlock()
 	if m.Jobs == nil {
 		m.Jobs = make(map[string]transport)
 	}
@@ -104,7 +110,7 @@ func (p porter) UnmarshalJob(b []byte) (Job, error) {
 
 func Test_SafeInvokePassingJob(t *testing.T) {
 	clearMiddleware()
-	w := initWorker("", &mockedSQS{}, 1)
+	w := NewWorker("", &mockedSQS{}, 1)
 
 	jobID := "job id"
 	job := TestJob{Resolve: Success}
@@ -132,7 +138,7 @@ func Test_SafeInvokePassingJob(t *testing.T) {
 
 func Test_SafeInvokeFailingJob(t *testing.T) {
 	clearMiddleware()
-	w := initWorker("", &mockedSQS{}, 1)
+	w := NewWorker("", &mockedSQS{}, 1)
 
 	jobID := "job id"
 	job := TestJob{Resolve: Fail}
@@ -160,7 +166,7 @@ func Test_SafeInvokeFailingJob(t *testing.T) {
 
 func Test_SafeInvokePanicJob(t *testing.T) {
 	clearMiddleware()
-	w := initWorker("", &mockedSQS{}, 1)
+	w := NewWorker("", &mockedSQS{}, 1)
 
 	jobID := "job id"
 	job := PanicJob{}

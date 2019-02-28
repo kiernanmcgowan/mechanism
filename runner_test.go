@@ -8,19 +8,24 @@ import (
 
 func Test_SimpleEndToEnd(t *testing.T) {
 	clearMiddleware()
-	w := initWorker("", &mockedSQS{}, 1)
+	w := NewWorker("", &mockedSQS{}, 1)
 
+	idLock := &sync.RWMutex{}
 	wg := sync.WaitGroup{}
 
 	var jobID string
 	wg.Add(1)
 	OnState(Enqueued, func(id string, j Job) {
+		idLock.Lock()
+		defer idLock.Unlock()
 		jobID = id
 		wg.Done()
 	})
 
 	wg.Add(1)
 	OnState(Pending, func(id string, j Job) {
+		idLock.Lock()
+		defer idLock.Unlock()
 		wg.Done()
 		if id != jobID {
 			t.Errorf("OnState - Pending passed wrong job id, got=%s wanted=%s", id, jobID)
@@ -29,6 +34,8 @@ func Test_SimpleEndToEnd(t *testing.T) {
 
 	wg.Add(1)
 	OnState(Succeeded, func(id string, j Job) {
+		idLock.Lock()
+		defer idLock.Unlock()
 		wg.Done()
 		if id != jobID {
 			t.Errorf("OnState - Succeeded passed wrong job id, got=%s wanted=%s", id, jobID)
@@ -38,7 +45,7 @@ func Test_SimpleEndToEnd(t *testing.T) {
 	job := TestJob{Resolve: Success}
 	job.Enqueue()
 
-	errc := w.Run()
+	errc := w.Start()
 
 	wg.Wait()
 

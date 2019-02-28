@@ -20,7 +20,7 @@ type PanicCallback func(string, interface{})
 // package level vars so jobs and middleware can be connected w/o the need for passing a worker around
 var (
 	encoderMap map[string]JobEncoder
-	jobQueue   *pusher
+	jobQueue   *Enqueuer
 	lock       *sync.RWMutex
 	callbacks  map[State][]Callback
 	panicedCBs []PanicCallback
@@ -48,11 +48,11 @@ type Worker struct {
 	quit       chan bool
 }
 
-// InitWorker creates a Worker pointed at the specified queueURL with the sqs service.
+// NewWorker creates a Worker pointed at the specified queueURL with the sqs service.
 // Workers will spawn up to maxJobs goroutines to process jobs from the SQS queue.
 // Note that setting maxJobs = 0 will remove parallelization of mechanism, causing one job to be processed at a time
-func InitWorker(queueURL string, sqs sqsiface.SQSAPI, maxJobs int) *Worker {
-	initPusher(queueURL, sqs)
+func NewWorker(queueURL string, sqs sqsiface.SQSAPI, maxJobs int) *Worker {
+	initEnqueuer(queueURL, sqs)
 	return &Worker{
 		puller: newPuller(queueURL, sqs),
 
@@ -62,49 +62,56 @@ func InitWorker(queueURL string, sqs sqsiface.SQSAPI, maxJobs int) *Worker {
 	}
 }
 
-func InitClient(queueURL string, sqs sqsiface.SQSAPI) <-chan error {
-	initPusher(queueURL, sqs)
-	return jobQueue.start()
+func NewEnqueuer(queueURL string, sqs sqsiface.SQSAPI) *Enqueuer {
+	initEnqueuer(queueURL, sqs)
+	return jobQueue
 }
 
-func initPusher(queueURL string, sqs sqsiface.SQSAPI) {
+func initEnqueuer(queueURL string, sqs sqsiface.SQSAPI) {
 	if jobQueue != nil {
 		return
 	}
-	jobQueue = newPusher(queueURL, sqs)
+	jobQueue = newEnqueuer(queueURL, sqs)
 }
 
 // Start turns on this mechanism worker.
 // The worker will start listening to the provided SQS queue and process jobs as they come in
 func (w *Worker) Start() <-chan error {
-	mergedErrc := merge(w.puller.start(), jobQueue.start(), w.errc)
+	mergedErrc := merge(w.puller.start(), jobQueue.Start(), w.errc)
 
 	go func() {
 		for {
 			select {
 			case <-w.quit:
 				w.puller.stop()
-				jobQueue.stop()
+				jobQueue.Stop()
 				close(w.errc)
 				return
 			case payload := <-w.puller.queue:
-				if _, ok := encoderMap[payload.Name]; !ok {
-					w.errc <- fmt.Errorf("Don't know how to deserialize job with name=%s", payload.Name)
-					continue
-				}
-
-				j, err := encoderMap[payload.Name].UnmarshalJob(payload.Payload)
-				if err != nil {
-					w.errc <- errors.Wrapf(err, "job unmarshal failed name=%s", payload.Name)
-					continue
-				}
-
-				go w.safeInvoke(payload.ID, j)
+				w.decodeAndRun(payload)
 			}
 		}
 	}()
 
 	return mergedErrc
+}
+
+func (w *Worker) decodeAndRun(payload transport) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	if _, ok := encoderMap[payload.Name]; !ok {
+		w.errc <- fmt.Errorf("Don't know how to deserialize job with name=%s", payload.Name)
+		return
+	}
+
+	j, err := encoderMap[payload.Name].UnmarshalJob(payload.Payload)
+	if err != nil {
+		w.errc <- errors.Wrapf(err, "job unmarshal failed name=%s", payload.Name)
+		return
+	}
+
+	go w.safeInvoke(payload.ID, j)
 }
 
 // Stop will cause this worker to stop pulling jobs for processing and will close channels for pushing jobs
@@ -141,6 +148,8 @@ func OnState(s State, c ...Callback) {
 }
 
 func notify(s State, id string, j Job) {
+	lock.Lock()
+	defer lock.Unlock()
 	// return if no callbacks have been registered
 	if _, ok := callbacks[s]; !ok {
 		return
@@ -177,18 +186,20 @@ func Use(m Middleware) {
 // Returns a send only channel for pushing jobs onto the queue or an error if there is already a job with the given name registered
 // Use this send only channel for enqueueing jobs.
 func RegisterJobEncoder(name string, e JobEncoder) (chan<- Job, error) {
+	lock.Lock()
+	defer lock.Unlock()
 	if _, ok := encoderMap[name]; ok {
 		return nil, fmt.Errorf("Job with name=%s already registered", name)
 	}
 
-	lock.Lock()
-	defer lock.Unlock()
 	encoderMap[name] = e
 
 	c := make(chan Job)
 	go func() {
 		for j := range c {
+			lock.Lock()
 			payload, err := encoderMap[name].MarshalJob(j)
+			lock.Unlock()
 			if err != nil {
 				err = errors.Wrapf(err, "job unmarshal failed name=%s", name)
 				log.WithError(err).Info("skipping job")

@@ -10,67 +10,88 @@ import (
 	"github.com/aws/aws-sdk-go/service/sqs/sqsiface"
 )
 
-type pusher struct {
+type Enqueuer struct {
 	sqsURL       string
 	sqs          sqsiface.SQSAPI
 	queue        chan transport
 	quit         chan bool
+	errc         chan error
+	drainCs      []chan bool
+	ts           []transport
 	flushTimeout time.Duration
 }
 
-func newPusher(sqsURL string, sqs sqsiface.SQSAPI) *pusher {
-	return &pusher{
+func newEnqueuer(sqsURL string, sqs sqsiface.SQSAPI) *Enqueuer {
+	return &Enqueuer{
 		sqsURL:       sqsURL,
 		sqs:          sqs,
 		queue:        make(chan transport, 10),
 		quit:         make(chan bool),
+		errc:         make(chan error),
 		flushTimeout: time.Second,
 	}
 }
 
-func (p *pusher) start() <-chan error {
-	var ts []transport
+func (p *Enqueuer) Start() <-chan error {
 	ticker := time.NewTicker(p.flushTimeout)
-	errc := make(chan error)
 	go func() {
 		for {
+			flush := false
 			select {
 			case t := <-p.queue:
-				ts = append(ts, t)
-				if len(ts) == 10 {
-					err := p.pushJobs(ts)
-					if err != nil {
-						errc <- err
-						continue
-					}
-					ts = nil
-				}
+				p.ts = append(p.ts, t)
+				flush = len(p.ts) == 10
 			case <-ticker.C:
-				if len(ts) > 0 {
-					err := p.pushJobs(ts)
-					if err != nil {
-						errc <- err
-						continue
-					}
-					ts = nil
-				}
+				flush = true
 			case <-p.quit:
-				close(errc)
+				close(p.errc)
 				close(p.queue)
 				return
 			}
 
+			if flush {
+				p.flush()
+			}
 		}
 	}()
 
-	return errc
+	return p.errc
 }
 
-func (p *pusher) stop() {
+func (p *Enqueuer) Stop() {
 	p.quit <- true
 }
 
-func (p *pusher) pushJobs(ts []transport) error {
+func (p *Enqueuer) flush() {
+	if len(p.ts) == 0 {
+		// non blocking send to channels
+		for _, c := range p.drainCs {
+			select {
+			case c <- true:
+			default:
+			}
+		}
+	} else if len(p.ts) > 0 {
+		err := p.pushJobs(p.ts)
+		if err != nil {
+			p.errc <- err
+		}
+		p.ts = nil
+	}
+}
+
+func (p *Enqueuer) DrainTicker() <-chan bool {
+	c := make(chan bool)
+	p.drainCs = append(p.drainCs, c)
+	return c
+}
+
+func (p *Enqueuer) WaitDrain() {
+	c := p.DrainTicker()
+	<-c
+}
+
+func (p *Enqueuer) pushJobs(ts []transport) error {
 	log.Debugf("pushing jobs count=%d", len(ts))
 	var entities []*sqs.SendMessageBatchRequestEntry
 
