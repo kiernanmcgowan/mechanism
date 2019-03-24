@@ -219,6 +219,16 @@ func RegisterJobEncoder(name string, e JobEncoder) (chan<- Job, error) {
 	return c, nil
 }
 
+// MustHaveEncoder asserts that the given job names have been registered. Mechanism will panic if a given job has not been register.
+// This is useful for double checking that all necessary jobs have been registered before pull jobs from the queue.
+func MustHaveEncoder(names ...string) {
+	for _, name := range names {
+		if _, ok := encoderMap[name]; !ok {
+			panic(fmt.Errorf("MustHaveEncoder - no encoder for %s has been registered", name))
+		}
+	}
+}
+
 func merge(cs ...<-chan error) <-chan error {
 	out := make(chan error)
 	var wg sync.WaitGroup
